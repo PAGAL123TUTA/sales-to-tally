@@ -5,14 +5,17 @@ import os
 
 app = Flask(__name__)
 
+# === Home page ===
 @app.route('/')
 def index():
     return render_template('index.html')
 
+# === Download template ===
 @app.route('/download-template')
 def download_template():
     return send_file("Template_S&P.xlsx", as_attachment=True)
 
+# === Convert Excel to Tally XML ===
 @app.route('/convert', methods=['POST'])
 def convert():
     file = request.files.get('file')
@@ -24,10 +27,10 @@ def convert():
     for col in ["Quantity", "Rate per Piece", "Final Amount", "CGST Amount", "SGST Amount", "IGST Amount"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+    # === XML structure setup ===
     envelope = ET.Element("ENVELOPE")
     header = ET.SubElement(envelope, "HEADER")
     ET.SubElement(header, "TALLYREQUEST").text = "Import Data"
-
     body = ET.SubElement(envelope, "BODY")
     importdata = ET.SubElement(body, "IMPORTDATA")
     requestdesc = ET.SubElement(importdata, "REQUESTDESC")
@@ -38,6 +41,7 @@ def convert():
 
     requestdata = ET.SubElement(importdata, "REQUESTDATA")
 
+    # === Process invoices ===
     for inv, group in df.groupby("Invoice Number"):
         vtype = str(group["Voucher Type"].iloc[0]).strip().lower()
         date_val = pd.to_datetime(group["Date"].iloc[0])
@@ -57,9 +61,8 @@ def convert():
         ET.SubElement(voucher, "ISINVOICE").text = "Yes"
         ET.SubElement(voucher, "NARRATION").text = str(group.get("Narration", [""]).iloc[0])
 
+        # === Stock Items and total calculation ===
         total_amount = 0
-
-        # === Stock Items ===
         for _, row in group.iterrows():
             amt = row["Final Amount"] if row["Final Amount"] > 0 else row["Quantity"] * row["Rate per Piece"]
             total_amount += amt
@@ -85,34 +88,33 @@ def convert():
             ("IGST Amount", "IGST LEDGER NAME")
         ]
         for amt_col, name_col in gst_map:
-            gst_total = group[amt_col].sum()
-            gst_name = str(group[name_col].iloc[0]) if name_col in group.columns else ""
-            if gst_total and gst_name and gst_name.lower() != "nan":
+            gst_total = group[amt_col].sum() if amt_col in group.columns else 0
+            gst_name = str(group[name_col].iloc[0]).strip() if name_col in group.columns else ""
+            if gst_total > 0 and gst_name and gst_name.lower() != "nan":
                 gst_entry = ET.SubElement(voucher, "LEDGERENTRIES.LIST")
                 ET.SubElement(gst_entry, "LEDGERNAME").text = gst_name
                 ET.SubElement(gst_entry, "ISDEEMEDPOSITIVE").text = "No" if vtype == "sales" else "Yes"
                 ET.SubElement(gst_entry, "AMOUNT").text = f"{gst_total if vtype == 'sales' else -gst_total:.2f}"
                 total_gst += gst_total
 
-        total_credit = total_amount + total_gst
-
-        # === Party Ledger Entry (auto-balanced)
+        # === Party Ledger Entry (auto-balanced) ===
         party_entry = ET.SubElement(voucher, "LEDGERENTRIES.LIST")
         ET.SubElement(party_entry, "LEDGERNAME").text = str(group["Party Name"].iloc[0])
         ET.SubElement(party_entry, "ISPARTYLEDGER").text = "Yes"
-
         if vtype == "sales":
-            ET.SubElement(party_entry, "ISDEEMEDPOSITIVE").text = "Yes"
-            ET.SubElement(party_entry, "AMOUNT").text = f"{-total_credit:.2f}"
-        else:  # Purchase
-            ET.SubElement(party_entry, "ISDEEMEDPOSITIVE").text = "No"
-            ET.SubElement(party_entry, "AMOUNT").text = f"{total_credit:.2f}"
+            ET.SubElement(party_entry, "ISDEEMEDPOSITIVE").text = "Yes"  # Debit
+            ET.SubElement(party_entry, "AMOUNT").text = f"{-(total_amount + total_gst):.2f}"
+        else:
+            ET.SubElement(party_entry, "ISDEEMEDPOSITIVE").text = "No"   # Credit
+            ET.SubElement(party_entry, "AMOUNT").text = f"{total_amount + total_gst:.2f}"
 
-    tree = ET.ElementTree(envelope)
+    # === Write output ===
     output_path = "S&P.xml"
+    tree = ET.ElementTree(envelope)
     tree.write(output_path, encoding="utf-8", xml_declaration=True)
     return send_file(output_path, as_attachment=True)
 
+# === Render compatibility ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
